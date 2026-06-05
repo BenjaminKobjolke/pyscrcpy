@@ -1,11 +1,9 @@
-import os
-import abc
-from pathlib import Path
+import random
 import socket
 import struct
 import threading
 import time
-from time import sleep
+from pathlib import Path
 from typing import Any, Callable, Optional, Tuple, Union
 
 import numpy as np
@@ -22,9 +20,17 @@ from .control import ControlSender
 
 Frame = npt.NDArray[np.int8]
 
-VERSION = "1.20"
+# Bundled scrcpy-server version. MUST match scrcpy-server.jar exactly or the server refuses to
+# start ("server version does not match"). v1.20 crashed on Android >= 14 (clipboard API change,
+# fixed upstream in 2.3.1); 3.3.1 supports current Android. Bumping the jar requires bumping this.
+VERSION = "3.3.1"
 HERE = Path(__file__).resolve().parent
-JAR = HERE / f"scrcpy-server.jar"
+JAR = HERE / "scrcpy-server.jar"
+
+# scrcpy 3.x video stream header: 4-byte codec id, u32 width, u32 height (big-endian).
+_CODEC_HEADER = ">4sII"
+# Map scrcpy codec id -> PyAV decoder name.
+_CODEC_TO_AV = {"h264": "h264", "h265": "hevc"}
 
 
 class Client:
@@ -40,31 +46,24 @@ class Client:
             skip_same_frame=False
     ):
         """
-        [ok]Create a scrcpy client. The client won't be started until you call .start()
+        Create a scrcpy client. The client won't be started until you call .start()
 
         Args:
-            device: Android device to coennect to. Colud be also specify by
-                serial string. If device is None the client try to connect
-                to the first available device in adb deamon.
-            max_size: Specify the maximum dimension of the video stream. This
-                dimensioin refer both to width and hight.0: no limit[已校验, max size of width or height]
-            bitrate: bitrate
-            max_fps: Maximum FPS (Frame Per Second) of the video stream. If it
-                is set to 0 it means that there is not limit to FPS.
-                This feature is supported by android 10 or newer.
-            [flip]: 没有这个参数, 会自动处理
-            block_frame: If set to true, the on_frame callbacks will be only
-                apply on not empty frames. Otherwise try to apply on_frame
-                callbacks on every frame, but this could raise exceptions in
-                callbacks if they are not able to handle None value for frame.
-                True:跳过空白帧
-            stay_awake: keep Android device awake while the client-server
-                connection is alive.
-            lock_screen_orientation: lock screen in a particular orientation.
-                The available screen orientation are specify in const.py
-                in variables LOCK_SCREEN_ORIENTATION*
+            device: Android device to connect to, or its serial string. If None, connect to the
+                first available adb device.
+            max_size: Max dimension (longest side) of the video stream. 0 = no limit.
+            bitrate: video bit rate.
+            max_fps: Max FPS. 0 = no limit (Android 10+). Must be > 0 if you rely on
+                min_frame_interval.
+            block_frame: if True, on_frame callbacks fire only on non-empty frames.
+            stay_awake: keep the device awake while connected.
+            lock_screen_orientation: kept for API compatibility (scrcpy 3.x manages orientation
+                differently); the value is not forwarded to the server.
+
+        Note: this fork is **view-only** -- control is disabled (control=false) so only the video
+        socket is opened. ``self.control`` exists for API compatibility but is not wired to a
+        socket under the 3.x protocol.
         """
-        # Params挪到后面去
         self.max_size = max_size
         self.bitrate = bitrate
         self.max_fps = max_fps
@@ -72,7 +71,7 @@ class Client:
         self.stay_awake = stay_awake
         self.lock_screen_orientation = lock_screen_orientation
         self.skip_same_frame = skip_same_frame
-        self.min_frame_interval = 1 / max_fps
+        self.min_frame_interval = 1 / max_fps if max_fps else 0
 
         if device is None:
             try:
@@ -89,109 +88,138 @@ class Client:
         self.last_frame: Optional[np.ndarray] = None
         self.resolution: Optional[Tuple[int, int]] = None
         self.device_name: Optional[str] = None
+        self.codec_name: str = "h264"
         self.control = ControlSender(self)
 
         # Need to destroy
         self.alive = False
+        self.scid: str = ""
         self.__server_stream: Optional[AdbConnection] = None
         self.__video_socket: Optional[socket.socket] = None
         self.control_socket: Optional[socket.socket] = None
         self.control_socket_lock = threading.Lock()
 
-    def __init_server_connection(self) -> None:
-        """
-        Connect to android server, there will be two sockets: video and control socket.
-         This method will also set resolution property.
-        """
-        for _ in range(30):  # 超时 写死
-            try:
-                self.__video_socket = self.device.create_connection(
-                    Network.LOCAL_ABSTRACT, "scrcpy"
-                )
-                break
-            except AdbError:
-                sleep(0.1)
-                pass
-        else:
-            raise ConnectionError("Failed to connect scrcpy-server after 3 seconds")
-
-        dummy_byte = self.__video_socket.recv(1)
-        if not len(dummy_byte):
-            raise ConnectionError("Did not receive Dummy Byte!")
-
-        self.control_socket = self.device.create_connection(
-            Network.LOCAL_ABSTRACT, "scrcpy"
-        )
-        self.device_name = self.__video_socket.recv(64).decode("utf-8").rstrip("\x00")
-        if not len(self.device_name):
-            raise ConnectionError("Did not receive Device Name!")
-
-        res = self.__video_socket.recv(4)
-        self.resolution = struct.unpack(">HH", res)
-        self.__video_socket.setblocking(False)
+    @staticmethod
+    def _random_scid() -> str:
+        """31-bit random id, hex; lets several scrcpy instances coexist on one device."""
+        return format(random.randint(0, 0x7FFFFFFF), "08x")
 
     def __deploy_server(self) -> None:
+        """Push scrcpy-server.jar and launch it with scrcpy 3.x ``key=value`` arguments.
+
+        Video-only (audio/control disabled). ``send_frame_meta=false`` -> a raw H264/H265 byte
+        stream (no per-frame headers), matching __stream_loop.
         """
-        Deploy server to android device.
-        Push the scrcpy-server.jar into the Android device using
-        the adb.push(...). Then a basic connection between client and server
-        is established.
-        """
+        self.scid = self._random_scid()
+        jar_remote = f"/data/local/tmp/scrcpy-server-{self.scid}.jar"
+
+        args = {
+            "log_level": "info",
+            "tunnel_forward": "true",
+            "send_frame_meta": "false",
+            "audio": "false",
+            "control": "false",
+            "video": "true",
+            "video_codec": "h264",
+            "stay_awake": "true" if self.stay_awake else "false",
+            "scid": self.scid,
+            "video_bit_rate": str(self.bitrate),
+        }
+        if self.max_size and self.max_size > 0:
+            args["max_size"] = str(self.max_size)
+        if self.max_fps and self.max_fps > 0:
+            args["max_fps"] = str(self.max_fps)
+
         cmd = [
-            "CLASSPATH=/data/local/tmp/scrcpy-server.jar",
+            f"CLASSPATH={jar_remote}",
             "app_process",
             "/",
             "com.genymobile.scrcpy.Server",
-            VERSION,  # Scrcpy server version
-            "info",  # Log level: info, verbose...
-            f"{self.max_size}",  # Max screen width (long side)
-            f"{self.bitrate}",  # Bitrate of video
-            f"{self.max_fps}",  # Max frame per second
-            f"{self.lock_screen_orientation}",  # Lock screen orientation
-            "true",  # Tunnel forward
-            "-",  # Crop screen
-            "false",  # Send frame rate to client
-            "true",  # Control enabled
-            "0",  # Display id
-            "false",  # Show touches
-            "true" if self.stay_awake else "false",  # Stay awake
-            "-",  # Codec (video encoding) options
-            "-",  # Encoder name
-            "false",  # Power off screen after server closed
-        ]
-        self.device.push(JAR, "/data/local/tmp/")
-        self.__server_stream: AdbConnection = self.device.shell(cmd, stream=True)
+            VERSION,
+        ] + [f"{k}={v}" for k, v in args.items()]
+
+        self.device.sync.push(str(JAR), jar_remote)
+        logger.debug(f"push scrcpy-server {VERSION} -> {jar_remote}")
+        logger.debug("scrcpy server cmd: " + " ".join(cmd))
+        self.__server_stream = self.device.shell(cmd, stream=True)
+        threading.Thread(target=self.__server_log_loop, daemon=True).start()
+
+    def __server_log_loop(self) -> None:
+        """Drain and log the server's stdout/stderr so crashes are visible (best-effort)."""
+        stream = self.__server_stream
+        if stream is None:
+            return
+        buf = ""
+        while self.alive or buf:
+            try:
+                chunk = stream.read_string(256)
+            except Exception:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if line.strip():
+                    logger.debug(f"[scrcpy-server] {line.strip()}")
+
+    def __init_server_connection(self) -> None:
+        """Open the video socket (scrcpy 3.x handshake) and read the codec metadata header."""
+        sock_name = f"scrcpy_{self.scid}"
+        for _ in range(100):  # ~5s: server may need a moment to start listening
+            try:
+                self.__video_socket = self.device.create_connection(
+                    Network.LOCAL_ABSTRACT, sock_name
+                )
+                break
+            except AdbError:
+                time.sleep(0.05)
+        else:
+            raise ConnectionError("Failed to connect scrcpy-server after 5 seconds")
+
+        dummy_byte = self.__video_socket.recv(1)
+        if not len(dummy_byte) or dummy_byte != b"\x00":
+            raise ConnectionError("Did not receive Dummy Byte!")
+
+        self.device_name = self.__recv_exactly(64).decode("utf-8").rstrip("\x00")
+        if not len(self.device_name):
+            raise ConnectionError("Did not receive Device Name!")
+
+        header = self.__recv_exactly(struct.calcsize(_CODEC_HEADER))
+        codec_raw, width, height = struct.unpack(_CODEC_HEADER, header)
+        self.codec_name = codec_raw.replace(b"\x00", b"").decode("utf-8")
+        self.resolution = (width, height)
+        logger.info(f"video codec={self.codec_name} resolution={width}x{height}")
+
+        self.__video_socket.setblocking(False)
+
+    def __recv_exactly(self, n: int) -> bytes:
+        """Receive exactly n bytes from the (blocking) video socket."""
+        data = b""
+        while len(data) < n:
+            chunk = self.__video_socket.recv(n - len(data))
+            if chunk == b"":
+                raise ConnectionError("Socket closed during handshake")
+            data += chunk
+        return data
 
     def start(self, threaded: bool = False) -> None:
-        """
-        Start the client-server connection.
-        In order to avoid unpredictable behaviors, this method must be called
-        after the on_init and on_frame callback are specify.
-
-        Args:
-            threaded : If set to True the stream loop willl run in a separated
-                thread. This mean that the code after client.strart() will be
-                run. Otherwise the client.start() method starts a endless loop
-                and the code after this method will never run. todo new_thread
-        """
+        """Start the client-server connection (register on_frame/on_init callbacks first)."""
         assert self.alive is False
 
         self.__deploy_server()
-        self.__init_server_connection()
         self.alive = True
+        self.__init_server_connection()
         for func in self.listeners[EVENT_INIT]:
             func(self)
 
-        if threaded:  # 不阻塞当前thread
+        if threaded:
             threading.Thread(target=self.__stream_loop).start()
         else:
             self.__stream_loop()
 
     def stop(self) -> None:
-        """
-        [ok]Close the various socket connection.
-        Stop listening (both threaded and blocked)
-        """
+        """Close all sockets / streams. Safe to call repeatedly."""
         self.alive = False
         try:
             self.__server_stream.close()
@@ -214,39 +242,23 @@ class Client:
             return 1
         gray1 = cv.cvtColor(img1, cv.COLOR_BGR2GRAY)
         gray2 = cv.cvtColor(img2, cv.COLOR_BGR2GRAY)
-
-        # 计算两张灰度图像的差异
         diff = cv2.absdiff(gray1, gray2)
-
-        # 设置阈值，忽略差异值较小的像素
         threshold = 30
         _, thresholded_diff = cv2.threshold(diff, threshold, 255, cv2.THRESH_BINARY)
-
-        # 计算差异像素的总数
-        total_diff_pixels = np.sum(thresholded_diff / 255)  # 除以255得到二值图像中白色像素的数量
-
-        # 计算图像的总像素数
+        total_diff_pixels = np.sum(thresholded_diff / 255)
         total_pixels = gray1.size
-
-        # 计算变化率
-        change_rate = total_diff_pixels / total_pixels
-        return change_rate
+        return total_diff_pixels / total_pixels
 
     def __stream_loop(self) -> None:
-        """
-        Core loop for video parsing.
-        While the connection is open (self.alive == True) recive raw h264 video
-        stream and decode it into frames. These frame are those passed to
-        on_frame callbacks.
-        """
-        codec = CodecContext.create("h264", "r")
+        """Receive the raw video stream and decode it into BGR frames via PyAV."""
+        codec = CodecContext.create(_CODEC_TO_AV.get(self.codec_name, "h264"), "r")
         while self.alive:
             try:
                 raw = self.__video_socket.recv(0x10000)
                 if raw == b"":
                     raise ConnectionError("Video stream is disconnected")
                 for packet in codec.parse(raw):
-                    for frame in codec.decode(packet):  # codec.decode(packet)包含多帧
+                    for frame in codec.decode(packet):
                         frame = frame.to_ndarray(format="bgr24")
 
                         if len(self.listeners[EVENT_ONCHANGE]) == 0 and not self.skip_same_frame:
@@ -256,44 +268,28 @@ class Client:
                             self.last_frame = frame
                             for func in self.listeners[EVENT_ONCHANGE]:
                                 func(self, frame)
-                        else:  # no_change and should skip this frame
+                        else:
                             continue
 
                         self.resolution = (frame.shape[1], frame.shape[0])
-                        for func in self.listeners[EVENT_FRAME]:  # 发送给用户自定义的函数
+                        for func in self.listeners[EVENT_FRAME]:
                             func(self, frame)
-            except (BlockingIOError, InvalidDataError):  # empty frame
+            except (BlockingIOError, InvalidDataError):  # no data ready / undecodable yet
                 time.sleep(0.01)
-                if not self.block_frame:  # init时允许空白帧
+                if not self.block_frame:
                     for func in self.listeners[EVENT_FRAME]:
                         func(self, None)
-            except (ConnectionError, OSError) as e:  # Socket Closed
+            except (ConnectionError, OSError) as e:  # socket closed
                 if self.alive:
-                    # todo on_disconnect event
                     self.stop()
                     raise e
 
     def on_init(self, func: Callable[[Any], None]) -> None:
-        """
-        Add funtion to on_init listeners.
-        Your function is run after client.start() is called.
-
-        Args:
-            func: callback to be called after the server starts. 参数:这个class的obj
-        """
+        """Add a callback run after the server starts."""
         self.listeners[EVENT_INIT].append(func)
 
     def on_frame(self, func: Callable[[Any, Frame], None]):
-        """
-        Add functoin to on-frame listeners.
-        Your function will be run on every valid frame recived.
-
-        Args:
-            func: callback to be called on every frame.
-
-        Returns:
-            The list of on-frame callbacks.
-        """
+        """Add a callback run on every valid frame."""
         self.listeners[EVENT_FRAME].append(func)
 
     def on_change(self, func: Callable[[Any, Frame], None]):
