@@ -1,7 +1,25 @@
 # Python Scrcpy Client
 
+> ## What this fork achieves
+>
+> Upstream `pyscrcpy` bundles **scrcpy-server v1.20** (2021), which **crashes on Android ≥ 14**
+> during server startup (`Device.<init>` → `IClipboard.addPrimaryClipChangedListener`
+> `NoSuchMethodException`). The server dies right after the handshake, so the video socket closes
+> and you get `ConnectionError: Video stream is disconnected` / black frames — modern phones
+> simply don't stream.
+>
+> **This fork fixes that:** it bundles the official **scrcpy-server v3.3.1** and ports the client
+> to the **scrcpy 3.x protocol** (random `scid`, `key=value` server args, `>4sII` codec-metadata
+> header, raw stream with `send_frame_meta=false`). Verified streaming on Android 16. The public
+> `Client` API is unchanged, so existing code keeps working.
+>
+> **View-only:** audio and control are disabled (`audio=false control=false`) — only the video
+> socket is opened. `client.control` exists for API compatibility but is not wired under the 3.x
+> protocol. To bump the server, replace `pyscrcpy/scrcpy-server.jar` and the matching `VERSION`
+> in `pyscrcpy/core.py` (they must match exactly).
+
 # Introduction
-![scrcpy-badge](https://img.shields.io/badge/scrcpy-v1.20-violet)
+![scrcpy-badge](https://img.shields.io/badge/scrcpy-v3.3.1-violet)
 
 A Python Library for scrcpy  
 pyscrcpy is an innovative Python library designed to simplify and streamline the integration of scrcpy into your Python projects. Scrcpy, a versatile screen mirroring tool for Android devices, gains a new level of accessibility through the seamless capabilities provided by pyscrcpy.
@@ -19,7 +37,7 @@ from pyscrcpy import Client # import scrcpy client
 
 
 def on_frame(client, frame):
-    client.control.touch(300,500)# emulate touch on(300,500)
+    # View-only fork: control is disabled. Just use the frame.
     cv.imshow('Video', frame)
     cv.waitKey(1)
 
